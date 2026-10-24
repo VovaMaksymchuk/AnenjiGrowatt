@@ -1,0 +1,560 @@
+# Growatt Hope 5.0L-B1 (CAN, Growatt BMS LV V1.04) -> Anenji ANJ-6200W-48V (RS485, Pylontech, меню 05 = Li2)
+# Плата: Waveshare ESP32-S3-Zero, SN65HVD230 (CAN), RS485<->TTL з автонапрямком.
+#
+# Безпека:
+#  - Немає свіжих 0x311/0x313 > ${stale_timeout_ms} мс -> основні сенсори = NaN -> pylontech_rs485 не відповідає
+#    інвертору (компонент мовчить, коли required-сенсор NaN) -> інвертор іде у warning 19.
+#  - Компонент Fahmula завжди шле "charge/discharge enable" = 1, тому заборона заряду/розряду
+#    передається нульовим max_charge_current / max_discharge_current.
+#  - Струм заряду/розряду = 0, якщо: 0x319 chg/dsg enable = 0, 0x319 застарів, активний відповідний
+#    захист у 0x312, або вимкнено вручну з HA.
+
+substitutions:
+  name: growatt-anenji-bridge
+  friendly_name: Growatt-Anenji Bridge
+  # Піни (ESP32-S3-Zero)
+  can_tx_pin: GPIO1
+  can_rx_pin: GPIO2
+  rs485_tx_pin: GPIO6
+  rs485_rx_pin: GPIO5
+  # Жорсткі стелі (паспорт Hope 5.0L-B1). BMS-ліміти з 0x311 обрізаються ними.
+  max_charge_v: "57.6"     # V
+  min_discharge_v: "48.0"  # V, Growatt його не передає
+  max_charge_a: "100.0"    # A
+  max_discharge_a: "100.0" # A
+  # Знак струму з 0x313. Pylontech: + = заряд. Якщо в HA під час заряду струм від'ємний -> "-1.0"
+  current_sign: "1.0"
+  stale_timeout_ms: "5000"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+external_components:
+  - source: github://fahmula/esphome-pylontech-rs485@main
+    refresh: 1d
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+  level: DEBUG
+  logs:
+    canbus: INFO
+    sensor: INFO
+    binary_sensor: INFO
+    text_sensor: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${name}"
+    password: !secret ap_password
+
+captive_portal:
+
+# ---------------------------------------------------------------- стан
+globals:
+  - id: t311
+    type: uint32_t
+    initial_value: "0"
+  - id: t313
+    type: uint32_t
+    initial_value: "0"
+  - id: t319
+    type: uint32_t
+    initial_value: "0"
+  - id: g_cv          # V, рекомендована напруга заряду (0x311)
+    type: float
+    initial_value: "0"
+  - id: g_ccl         # A
+    type: float
+    initial_value: "0"
+  - id: g_dcl         # A
+    type: float
+    initial_value: "0"
+  - id: g_prot        # 0x312 byte0<<8 | byte1 (захисти)
+    type: uint16_t
+    initial_value: "0"
+  - id: g_f319        # 0x319 byte0
+    type: uint8_t
+    initial_value: "0"
+  - id: g_stale       # дані вже позначені як застарілі (NaN опубліковано)
+    type: bool
+    initial_value: "true"
+
+# ---------------------------------------------------------------- CAN: батарея
+canbus:
+  - platform: esp32_can
+    id: can_bus
+    tx_pin: ${can_tx_pin}
+    rx_pin: ${can_rx_pin}
+    can_id: 0x301
+    bit_rate: 500KBPS
+    on_frame:
+      # 0x300..0x33F, розбір за can_id (як decodeGrowatt() у src/main.cpp)
+      - can_id: 0x300
+        can_id_mask: 0x7C0
+        then:
+          - lambda: |-
+              if (x.size() < 8) return;
+              auto be16 = [&](int o) -> uint16_t { return (uint16_t(x[o]) << 8) | x[o + 1]; };
+              auto bes16 = [&](int o) -> int16_t { return (int16_t) be16(o); };
+              const uint32_t now = millis();
+
+              switch (can_id) {
+                case 0x311: {
+                  id(t311) = now;
+                  id(g_cv) = be16(0) * 0.1f;
+                  id(g_ccl) = be16(2) * 0.1f;
+                  id(g_dcl) = be16(4) * 0.1f;
+                  const uint16_t st = be16(6);
+                  id(bms_cv).publish_state(id(g_cv));
+                  id(bms_ccl).publish_state(id(g_ccl));
+                  id(bms_dcl).publish_state(id(g_dcl));
+                  static const char *const states[] = {"soft start", "standby", "charging", "discharging"};
+                  id(bms_state).publish_state(states[st & 3]);
+                  id(bms_balancing).publish_state((st >> 3) & 1);
+                  id(bms_chg_mosfet).publish_state((st >> 6) & 1);
+                  id(bms_dsg_mosfet).publish_state((st >> 5) & 1);
+                  break;
+                }
+                case 0x312: {
+                  const uint8_t p1 = x[0], p2 = x[1], a1 = x[2], a2 = x[3];
+                  id(g_prot) = (uint16_t(p1) << 8) | p2;
+                  char buf[24];
+                  snprintf(buf, sizeof(buf), "P %02X %02X  A %02X %02X", p1, p2, a1, a2);
+                  id(bms_flags_raw).publish_state(buf);
+                  if (x[7]) id(bms_cells_count).publish_state(x[7]);  // Hope шле 0
+                  // Protection, Table 1 / Table 2
+                  id(prot_dsg_oc).publish_state((p1 & 0xA0) != 0);   // b7 dsg OC, b5 SCD
+                  id(prot_chg_oc).publish_state(p1 & 0x40);
+                  id(prot_cell_ov).publish_state(p1 & 0x10);
+                  id(prot_cell_uv).publish_state(p1 & 0x08);
+                  id(prot_mod_ov).publish_state(p1 & 0x04);
+                  id(prot_mod_uv).publish_state(p1 & 0x02);
+                  id(prot_over_temp).publish_state((p2 & 0xC0) != 0);   // OTD, OTC
+                  id(prot_under_temp).publish_state((p2 & 0x30) != 0);  // UTD, UTC
+                  id(prot_system).publish_state((p1 & 0x01) || (p2 & 0x0C));  // soft start fail, system error, delta V fail
+                  // Alarm, Table 3 / Table 4
+                  id(alarm_dsg_oc).publish_state(a1 & 0x80);
+                  id(alarm_chg_oc).publish_state(a1 & 0x40);
+                  id(alarm_cell_ov).publish_state(a1 & 0x10);
+                  id(alarm_cell_uv).publish_state(a1 & 0x08);
+                  id(alarm_mod_ov).publish_state(a1 & 0x04);
+                  id(alarm_mod_uv).publish_state(a1 & 0x02);
+                  id(alarm_over_temp).publish_state((a2 & 0xC0) != 0);
+                  id(alarm_under_temp).publish_state((a2 & 0x30) != 0);
+                  id(alarm_delta_v).publish_state(a2 & 0x04);
+                  break;
+                }
+                case 0x313: {
+                  id(t313) = now;
+                  const float v = bes16(0) * 0.01f;
+                  const float i = bes16(2) * 0.1f * ${current_sign};
+                  id(bat_voltage).publish_state(v);
+                  id(bat_current).publish_state(i);
+                  id(bat_power).publish_state(v * i);
+                  id(bat_temp).publish_state(bes16(4) * 0.1f);
+                  id(bat_soc).publish_state(x[6]);
+                  id(bat_soh).publish_state(x[7] & 0x7F);
+                  break;
+                }
+                case 0x314:
+                  id(bat_rm).publish_state(be16(0) * 0.01f);
+                  id(bat_fcc).publish_state(be16(2) * 0.01f);
+                  id(cell_delta).publish_state(be16(4));
+                  id(bat_cycles).publish_state(be16(6));
+                  break;
+                case 0x315: case 0x316: case 0x317: case 0x318: {
+                  sensor::Sensor *cells[16] = {
+                    id(cell01), id(cell02), id(cell03), id(cell04), id(cell05), id(cell06), id(cell07), id(cell08),
+                    id(cell09), id(cell10), id(cell11), id(cell12), id(cell13), id(cell14), id(cell15), id(cell16)};
+                  const int base = (can_id - 0x315) * 4;
+                  for (int k = 0; k < 4; k++) cells[base + k]->publish_state(be16(k * 2) * 0.001f);
+                  break;
+                }
+                case 0x319:
+                  id(t319) = now;
+                  id(g_f319) = x[0];
+                  id(bms_chg_enable).publish_state(x[0] & 0x80);
+                  id(bms_dsg_enable).publish_state(x[0] & 0x40);
+                  id(bms_force_charge).publish_state(x[0] & 0x20);
+                  id(cell_vmax).publish_state(be16(1) * 0.001f);
+                  id(cell_vmin).publish_state(be16(3) * 0.001f);
+                  break;
+                case 0x320: {
+                  char buf[32];
+                  snprintf(buf, sizeof(buf), "%c%c hw%u sw%u",
+                           isprint(x[0]) ? x[0] : '?', isprint(x[1]) ? x[1] : '?', x[2], x[3]);
+                  if (id(bms_info).state != buf) id(bms_info).publish_state(buf);
+                  break;
+                }
+              }
+
+interval:
+  - interval: 1s
+    then:
+      # Запит до батареї (протокол: "інвертор" шле 0x301 раз на секунду)
+      - canbus.send:
+          canbus_id: can_bus
+          can_id: 0x301
+          data: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+      # Watchdog + ефективні ліміти для інвертора
+      - lambda: |-
+          const uint32_t now = millis();
+          auto fresh = [&](uint32_t t) { return t != 0 && (now - t) < ${stale_timeout_ms}; };
+
+          if (!fresh(id(t311)) || !fresh(id(t313))) {
+            if (!id(g_stale)) {
+              ESP_LOGW("bridge", "Growatt CAN data stale -> RS485 emulator muted");
+              id(g_stale) = true;
+              id(can_link).publish_state(false);
+              for (auto *s : {id(bat_soc), id(bat_voltage), id(bat_current), id(bat_temp),
+                              id(lim_max_v), id(lim_min_v), id(lim_chg_i), id(lim_dsg_i)})
+                s->publish_state(NAN);
+            }
+            return;
+          }
+          if (id(g_stale)) {
+            ESP_LOGI("bridge", "Growatt CAN data OK -> RS485 emulator active");
+            id(g_stale) = false;
+            id(can_link).publish_state(true);
+          }
+
+          // Захисти 0x312 (byte0<<8 | byte1), що забороняють заряд / розряд
+          const uint16_t CHG_BLOCK = 0x5558;  // chg OC, cell OV, module OV, soft start fail | OTC, UTC, system error
+          const uint16_t DSG_BLOCK = 0xABA8;  // dsg OC, SCD, cell UV, module UV, soft start fail | OTD, UTD, system error
+          const bool f319_ok = fresh(id(t319));
+          const float cv = id(g_cv);
+
+          const bool chg_ok = f319_ok && (id(g_f319) & 0x80) && !(id(g_prot) & CHG_BLOCK) &&
+                              cv >= ${min_discharge_v} && id(allow_charge).state;
+          const bool dsg_ok = f319_ok && (id(g_f319) & 0x40) && !(id(g_prot) & DSG_BLOCK) &&
+                              id(allow_discharge).state;
+
+          id(lim_max_v).publish_state(std::min(cv, ${max_charge_v}f));
+          id(lim_min_v).publish_state(${min_discharge_v});
+          id(lim_chg_i).publish_state(chg_ok ? std::min(id(g_ccl), ${max_charge_a}f) : 0.0f);
+          id(lim_dsg_i).publish_state(dsg_ok ? std::min(id(g_dcl), ${max_discharge_a}f) : 0.0f);
+
+# ---------------------------------------------------------------- RS485: інвертор (Pylontech)
+uart:
+  id: uart_inverter
+  tx_pin: ${rs485_tx_pin}
+  rx_pin: ${rs485_rx_pin}
+  baud_rate: 9600
+
+pylontech_rs485:
+  uart_id: uart_inverter
+  # Увага: у цьому компоненті timeout лише гасить rs485_status, коли інвертор перестає питати.
+  # Відповіді при застарілих даних блокує watchdog вище (NaN у core-сенсорах).
+  update_timeout: 10s
+  state_of_charge: bat_soc
+  voltage: bat_voltage
+  current: bat_current
+  temperature: bat_temp
+  max_temperature: bat_temp
+  state_of_health: bat_soh
+  cycle_count: bat_cycles
+  max_cell_voltage: cell_vmax
+  min_cell_voltage: cell_vmin
+  max_voltage: lim_max_v
+  min_voltage: lim_min_v
+  max_charge_current: lim_chg_i
+  max_discharge_current: lim_dsg_i
+  requested_force_charge: bms_force_charge
+  rs485_status: rs485_link
+  inverter_heartbeat: inverter_heartbeat
+  # Мапінг 0x312 -> Pylontech 0x62
+  total_voltage_high_alarm: alarm_mod_ov
+  total_voltage_low_alarm: alarm_mod_uv
+  cell_voltage_high_alarm: alarm_cell_ov
+  cell_voltage_low_alarm: alarm_cell_uv
+  cell_temp_high_alarm: alarm_over_temp
+  cell_temp_low_alarm: alarm_under_temp
+  cell_imbalance_alarm: alarm_delta_v
+  charge_overcurrent_alarm: alarm_chg_oc
+  discharge_overcurrent_alarm: alarm_dsg_oc
+  module_overvoltage_protection: prot_mod_ov
+  module_undervoltage_protection: prot_mod_uv
+  cell_overvoltage_protection: prot_cell_ov
+  cell_undervoltage_protection: prot_cell_uv
+  cell_overtemp_protection: prot_over_temp
+  cell_undertemp_protection: prot_under_temp
+  charge_overcurrent_protection: prot_chg_oc
+  discharge_overcurrent_protection: prot_dsg_oc
+  system_fault_protection: prot_system
+
+# ---------------------------------------------------------------- ручне керування з HA
+switch:
+  - platform: template
+    id: allow_charge
+    name: Allow charge
+    icon: mdi:battery-arrow-up
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: template
+    id: allow_discharge
+    name: Allow discharge
+    icon: mdi:battery-arrow-down
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+# ---------------------------------------------------------------- сенсори
+sensor:
+  # Основні (з них читає емулятор; NaN = мовчати)
+  - platform: template
+    id: bat_soc
+    name: Battery SOC
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: bat_voltage
+    name: Battery voltage
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+  - platform: template
+    id: bat_current
+    name: Battery current
+    unit_of_measurement: A
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: bat_power
+    name: Battery power
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: bat_temp
+    name: Battery max temperature
+    unit_of_measurement: °C
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  # Ліміти, які йдуть в інвертор
+  - platform: template
+    id: lim_max_v
+    name: Inverter charge voltage limit
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: lim_min_v
+    name: Inverter discharge voltage limit
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 1
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    id: lim_chg_i
+    name: Inverter charge current limit
+    unit_of_measurement: A
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: lim_dsg_i
+    name: Inverter discharge current limit
+    unit_of_measurement: A
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: never
+
+  # Сирі дані BMS
+  - platform: template
+    id: bms_cv
+    name: BMS charge voltage
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 1
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    id: bms_ccl
+    name: BMS charge current limit
+    unit_of_measurement: A
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    id: bms_dcl
+    name: BMS discharge current limit
+    unit_of_measurement: A
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    id: bat_soh
+    name: Battery SOH
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    id: bat_rm
+    name: Battery remaining capacity
+    unit_of_measurement: Ah
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+  - platform: template
+    id: bat_fcc
+    name: Battery full capacity
+    unit_of_measurement: Ah
+    accuracy_decimals: 2
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    id: bat_cycles
+    name: Battery cycles
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    id: bms_cells_count
+    name: BMS cell count
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    id: cell_vmax
+    name: Cell voltage max
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: cell_vmin
+    name: Cell voltage min
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: cell_delta
+    name: Cell voltage delta
+    unit_of_measurement: mV
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: inverter_heartbeat
+    name: Inverter heartbeat
+    update_interval: never
+    entity_category: diagnostic
+
+  # Комірки 1..16 (0x315..0x318, батарея може не слати)
+  - { platform: template, id: cell01, name: Cell 01, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell02, name: Cell 02, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell03, name: Cell 03, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell04, name: Cell 04, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell05, name: Cell 05, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell06, name: Cell 06, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell07, name: Cell 07, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell08, name: Cell 08, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell09, name: Cell 09, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell10, name: Cell 10, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell11, name: Cell 11, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell12, name: Cell 12, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell13, name: Cell 13, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell14, name: Cell 14, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell15, name: Cell 15, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+  - { platform: template, id: cell16, name: Cell 16, unit_of_measurement: V, device_class: voltage, accuracy_decimals: 3, update_interval: never, entity_category: diagnostic }
+
+  - platform: wifi_signal
+    name: WiFi signal
+    update_interval: 60s
+    entity_category: diagnostic
+
+binary_sensor:
+  - platform: template
+    id: can_link
+    name: Battery CAN link
+    device_class: connectivity
+    entity_category: diagnostic
+  - platform: template
+    id: rs485_link
+    name: Inverter RS485 link
+    device_class: connectivity
+    entity_category: diagnostic
+
+  # 0x319 / 0x311
+  - { platform: template, id: bms_chg_enable, name: BMS charge enable }
+  - { platform: template, id: bms_dsg_enable, name: BMS discharge enable }
+  - { platform: template, id: bms_force_charge, name: BMS force charge request }
+  - { platform: template, id: bms_chg_mosfet, name: BMS charge output, entity_category: diagnostic }
+  - { platform: template, id: bms_dsg_mosfet, name: BMS discharge output, entity_category: diagnostic }
+  - { platform: template, id: bms_balancing, name: BMS balancing, entity_category: diagnostic }
+
+  # 0x312 захисти
+  - { platform: template, id: prot_chg_oc, name: Protection charge overcurrent, device_class: problem }
+  - { platform: template, id: prot_dsg_oc, name: Protection discharge overcurrent/short, device_class: problem }
+  - { platform: template, id: prot_cell_ov, name: Protection cell overvoltage, device_class: problem }
+  - { platform: template, id: prot_cell_uv, name: Protection cell undervoltage, device_class: problem }
+  - { platform: template, id: prot_mod_ov, name: Protection module overvoltage, device_class: problem }
+  - { platform: template, id: prot_mod_uv, name: Protection module undervoltage, device_class: problem }
+  - { platform: template, id: prot_over_temp, name: Protection over temperature, device_class: problem }
+  - { platform: template, id: prot_under_temp, name: Protection under temperature, device_class: problem }
+  - { platform: template, id: prot_system, name: Protection system fault, device_class: problem }
+
+  # 0x312 тривоги
+  - { platform: template, id: alarm_chg_oc, name: Alarm charge overcurrent, device_class: problem, entity_category: diagnostic }
+  - { platform: template, id: alarm_dsg_oc, name: Alarm discharge overcurrent, device_class: problem, entity_category: diagnostic }
+  - { platform: template, id: alarm_cell_ov, name: Alarm cell overvoltage, device_class: problem, entity_category: diagnostic }
+  - { platform: template, id: alarm_cell_uv, name: Alarm cell undervoltage, device_class: problem, entity_category: diagnostic }
+  - { platform: template, id: alarm_mod_ov, name: Alarm module overvoltage, device_class: problem, entity_category: diagnostic }
+  - { platform: template, id: alarm_mod_uv, name: Alarm module undervoltage, device_class: problem, entity_category: diagnostic }
+  - { platform: template, id: alarm_over_temp, name: Alarm over temperature, device_class: problem, entity_category: diagnostic }
+  - { platform: template, id: alarm_under_temp, name: Alarm under temperature, device_class: problem, entity_category: diagnostic }
+  - { platform: template, id: alarm_delta_v, name: Alarm cell imbalance, device_class: problem, entity_category: diagnostic }
+
+text_sensor:
+  - platform: template
+    id: bms_state
+    name: BMS state
+    update_interval: never
+  - platform: template
+    id: bms_flags_raw
+    name: BMS protection/alarm raw
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    id: bms_info
+    name: BMS info
+    update_interval: never
+    entity_category: diagnostic
